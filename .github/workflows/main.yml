@@ -1,0 +1,260 @@
+name: Visual Regression Dashboard
+
+on:
+  workflow_dispatch:
+
+jobs:
+  visual-test:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download bore tunnel
+        run: |
+          $url = "https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\bore.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\bore.zip" -DestinationPath "$env:RUNNER_TEMP\bore" -Force
+          Write-Host "[VISUAL] Bore ready"
+        shell: pwsh
+
+      - name: Start dashboard and tunnel
+        run: |
+          $auth = "${{ github.run_id }}-${{ github.run_attempt }}"
+          $port = 8080
+
+          # Write a diagnostic HTML
+          $html = @"
+          <!DOCTYPE html>
+          <html>
+          <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+          <title>Dashboard Test</title>
+          <style>
+          *{margin:0;padding:0;box-sizing:border-box;}
+          body{background:#0d1117;color:white;font-family:monospace;padding:10px;}
+          h2{color:#3fb950;margin-bottom:10px;}
+          a{color:#58a6ff;}
+          .box{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;margin:10px 0;}
+          button{background:#21262d;color:white;border:1px solid #30363d;padding:10px;margin:4px;border-radius:6px;cursor:pointer;font-size:14px;}
+          button:active{background:#30363d;}
+          img{max-width:100%;border:1px solid #30363d;margin-top:10px;}
+          #log{color:#8b949e;font-size:11px;margin-top:10px;}
+          </style>
+          </head>
+          <body>
+          <h2>⚡ Dashboard Diagnostic</h2>
+          <div class="box">
+          <b>Auth:</b> $auth<br>
+          <b>Server:</b> ONLINE<br>
+          <b>Tunnel:</b> bore.pub:$port (will fill)
+          </div>
+          <div class="box">
+          <h3>Test Endpoints:</h3>
+          <button onclick="testPing()">Test /ping</button>
+          <button onclick="loadShot()">Load /shot</button>
+          <button onclick="loadShotDirect()">Direct /shot link</button>
+          <a href="/shot" target="_blank">Open /shot in new tab</a>
+          </div>
+          <div class="box" id="result">
+          Results will appear here...
+          </div>
+          <img id="screenshot" style="display:none;" />
+          <div id="log"></div>
+          <script>
+          var auth='$auth';
+          function log(msg){document.getElementById('log').textContent+=msg+'\\n';}
+          document.getElementById('result').textContent='Auth: $auth | Ready';
+          
+          function testPing(){
+            fetch('/ping').then(r=>r.text()).then(t=>{
+              document.getElementById('result').textContent='PING: '+t;
+              log('Ping OK: '+t);
+            }).catch(e=>{
+              document.getElementById('result').textContent='PING FAIL: '+e.message;
+            });
+          }
+          
+          function loadShot(){
+            var img=document.getElementById('screenshot');
+            img.style.display='block';
+            img.src='/shot?t='+Date.now();
+            img.onload=function(){
+              document.getElementById('result').textContent='Shot loaded: '+img.naturalWidth+'x'+img.naturalHeight;
+              log('Image loaded OK');
+            };
+            img.onerror=function(){
+              document.getElementById('result').textContent='Shot FAILED to load';
+              log('Image error');
+            };
+          }
+          
+          function loadShotDirect(){
+            window.open('/shot?t='+Date.now(), '_blank');
+          }
+          
+          // Auto-test on load
+          setTimeout(testPing, 500);
+          setTimeout(loadShot, 1000);
+          </script>
+          </body>
+          </html>
+          "@
+
+          # Write the server script
+          $serverScript = @"
+          `$port = $port
+          `$html = @'
+          $html
+          '@
+          `$auth = '$auth'
+          
+          # Force create a desktop window to make CopyFromScreen work
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          
+          `$listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, `$port)
+          `$listener.Start()
+          Write-Host "[VISUAL] Server listening on 127.0.0.1:`$port"
+
+          while (`$listener.Server.IsBound) {
+              try {
+                  `$client = `$listener.AcceptTcpClient()
+                  `$stream = `$client.GetStream()
+                  `$reader = New-Object System.IO.StreamReader(`$stream)
+                  `$writer = New-Object System.IO.StreamWriter(`$stream)
+                  `$writer.AutoFlush = `$true
+
+                  `$requestLine = `$reader.ReadLine()
+                  if (!`$requestLine) { `$client.Close(); continue }
+                  `$parts = `$requestLine -split ' '
+                  `$method = `$parts[0]
+                  `$path = `$parts[1]
+
+                  `$contentLength = 0
+                  while (`$true) {
+                      `$line = `$reader.ReadLine()
+                      if (`$line -eq '' -or `$line -eq "`r") { break }
+                      if (`$line -match 'Content-Length: (\d+)') { `$contentLength = [int]`$Matches[1] }
+                  }
+
+                  `$body = ''
+                  if (`$contentLength -gt 0) {
+                      `$buffer = New-Object char[] `$contentLength
+                      `$reader.Read(`$buffer, 0, `$contentLength)
+                      `$body = -join `$buffer
+                  }
+
+                  if (`$path -eq '/ping') {
+                      `$msg = "alive|port=`$port|auth=`$auth|time=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                      `$bytes = [System.Text.Encoding]::UTF8.GetBytes(`$msg)
+                      `$writer.WriteLine("HTTP/1.1 200 OK")
+                      `$writer.WriteLine("Content-Type: text/plain")
+                      `$writer.WriteLine("Content-Length: $($bytes.Length)")
+                      `$writer.WriteLine()
+                      `$writer.Flush()
+                      `$stream.Write(`$bytes, 0, `$bytes.Length)
+                  }
+                  elseif (`$path -match '/shot') {
+                      try {
+                          # Capture screen
+                          `$screen = [System.Windows.Forms.Screen]::PrimaryScreen
+                          `$w = `$screen.Bounds.Width
+                          `$h = `$screen.Bounds.Height
+                          
+                          `$bmp = New-Object System.Drawing.Bitmap(`$w, `$h)
+                          `$g = [System.Drawing.Graphics]::FromImage(`$bmp)
+                          `$g.CopyFromScreen(`$screen.Bounds.X, `$screen.Bounds.Y, 0, 0, `$bmp.Size)
+                          `$g.Dispose()
+                          
+                          `$ms = New-Object System.IO.MemoryStream
+                          `$bmp.Save(`$ms, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                          `$bmp.Dispose()
+                          `$bytes = `$ms.ToArray()
+                          `$ms.Dispose()
+                          
+                          Write-Host "[VISUAL] Screenshot captured: $($bytes.Length) bytes, ${w}x${h}"
+                          
+                          `$writer.WriteLine("HTTP/1.1 200 OK")
+                          `$writer.WriteLine("Content-Type: image/jpeg")
+                          `$writer.WriteLine("Cache-Control: no-cache")
+                          `$writer.WriteLine("Content-Length: $($bytes.Length)")
+                          `$writer.WriteLine()
+                          `$writer.Flush()
+                          `$stream.Write(`$bytes, 0, `$bytes.Length)
+                      } catch {
+                          Write-Host "[VISUAL] Screenshot error: $_"
+                          `$writer.WriteLine("HTTP/1.1 500 Error")
+                          `$writer.WriteLine("Content-Type: text/plain")
+                          `$err = "Error: $_"
+                          `$bytes = [System.Text.Encoding]::UTF8.GetBytes(`$err)
+                          `$writer.WriteLine("Content-Length: $($bytes.Length)")
+                          `$writer.WriteLine()
+                          `$writer.Flush()
+                          `$stream.Write(`$bytes, 0, `$bytes.Length)
+                      }
+                  }
+                  elseif (`$path -eq '/') {
+                      `$bytes = [System.Text.Encoding]::UTF8.GetBytes(`$html)
+                      `$writer.WriteLine("HTTP/1.1 200 OK")
+                      `$writer.WriteLine("Content-Type: text/html; charset=utf-8")
+                      `$writer.WriteLine("Content-Length: $($bytes.Length)")
+                      `$writer.WriteLine()
+                      `$writer.Flush()
+                      `$stream.Write(`$bytes, 0, `$bytes.Length)
+                  }
+                  else {
+                      `$writer.WriteLine("HTTP/1.1 404 Not Found")
+                      `$writer.WriteLine("Content-Length: 0")
+                      `$writer.WriteLine()
+                  }
+
+                  `$stream.Flush()
+                  `$client.Close()
+              }
+              catch {
+                  Write-Host "[VISUAL] Request error: $_"
+                  try { `$client.Close() } catch {}
+              }
+          }
+          "@
+
+          $serverPath = "$env:RUNNER_TEMP\server.ps1"
+          $serverScript | Out-File -FilePath $serverPath -Encoding UTF8
+
+          Write-Host "[VISUAL] Starting dashboard server..."
+          $proc = Start-Process powershell -ArgumentList "-File `"$serverPath`"" -WindowStyle Hidden -PassThru
+          
+          Start-Sleep -Seconds 3
+
+          $test = Test-NetConnection -ComputerName 127.0.0.1 -Port $port -WarningAction SilentlyContinue
+          if ($test.TcpTestSucceeded) {
+              Write-Host "[VISUAL] Server confirmed on 127.0.0.1:$port"
+              # Quick curl test
+              try {
+                  $result = Invoke-WebRequest -Uri "http://127.0.0.1:$port/ping" -UseBasicParsing -TimeoutSec 3
+                  Write-Host "[VISUAL] PING TEST: $($result.Content)"
+              } catch {
+                  Write-Host "[VISUAL] Ping test failed: $_"
+              }
+          } else {
+              Write-Host "[VISUAL] WARNING: Port not responding"
+          }
+
+          Write-Host "[VISUAL] =============================================="
+          Write-Host "[VISUAL] Auth: $auth"
+          Write-Host "[VISUAL] 1. Wait for bore URL below"
+          Write-Host "[VISUAL] 2. Test: http://bore.pub:PORT/ping"
+          Write-Host "[VISUAL] 3. Dashboard: http://bore.pub:PORT/"
+          Write-Host "[VISUAL] =============================================="
+
+          & "$env:RUNNER_TEMP\bore\bore.exe" local $port --to bore.pub
+
+          while ($true) {
+              Write-Host "[VISUAL] $(Get-Date) - Dashboard active"
+              Start-Sleep -Seconds 300
+          }
+        shell: pwsh
