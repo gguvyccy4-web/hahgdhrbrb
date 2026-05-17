@@ -1,0 +1,253 @@
+name: Visual Regression Dashboard
+
+on:
+  workflow_dispatch:
+
+jobs:
+  visual-test:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download bore tunnel
+        run: |
+          $url = "https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\bore.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\bore.zip" -DestinationPath "$env:RUNNER_TEMP\bore" -Force
+          Write-Host "[VISUAL] Bore ready"
+        shell: pwsh
+
+      - name: Start dashboard and tunnel
+        run: |
+          $auth = "${{ github.run_id }}-${{ github.run_attempt }}"
+          $port = 8080
+
+          # Build the HTML page
+          $html = @"
+          <!DOCTYPE html>
+          <html><head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+          <title>Dashboard</title>
+          <style>
+          *{margin:0;padding:0;box-sizing:border-box;}
+          body{background:#0d1117;font-family:system-ui;touch-action:manipulation;overflow:hidden;height:100vh;}
+          #img{width:100%;height:auto;display:block;}
+          #bar{position:fixed;bottom:12px;left:50%;transform:translateX(-50%);display:flex;gap:6px;background:rgba(22,27,34,0.95);padding:8px 12px;border-radius:22px;border:1px solid #30363d;z-index:10;}
+          .b{background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:10px 12px;border-radius:14px;font-size:11px;cursor:pointer;touch-action:manipulation;}
+          .b:active{background:#30363d;}
+          #inp{position:fixed;bottom:80px;left:50%;transform:translateX(-50%);display:none;z-index:10;}
+          #inp input{background:#161b22;border:1px solid #30363d;color:#c9d1d9;padding:8px 14px;border-radius:16px;font-size:14px;width:60vw;outline:none;}
+          #st{position:fixed;top:8px;right:8px;color:#3fb950;font-size:10px;font-family:monospace;background:rgba(0,0,0,0.8);padding:4px 10px;border-radius:12px;}
+          </style></head><body>
+          <img id="img" src="/shot" />
+          <div id="st">LIVE</div>
+          <div id="bar">
+          <button class="b" id="bw">Win</button>
+          <button class="b" id="be">Esc</button>
+          <button class="b" id="bt">Tab</button>
+          <button class="b" id="br">Enter</button>
+          <button class="b" id="bs">Space</button>
+          <button class="b" id="bb">Back</button>
+          <button class="b" id="bk">Type</button>
+          </div>
+          <div id="inp"><input id="ki" placeholder="Type then Enter" /></div>
+          <script>
+          var a='$auth',img=document.getElementById('img'),st=document.getElementById('st');
+          function shot(){img.src='/shot?t='+Date.now();st.textContent='LIVE';}
+          function send(d){d.auth=a;fetch('/in',{method:'POST',body:JSON.stringify(d)}).catch(function(){st.textContent='ERR'});}
+          function xy(e){var r=img.getBoundingClientRect(),c=e.touches?e.touches[0]:e;return{x:Math.round((c.clientX-r.left)*(img.naturalWidth/r.width)),y:Math.round((c.clientY-r.top)*(img.naturalHeight/r.height))};}
+          var lt=0,tt=null;
+          img.addEventListener('touchstart',function(e){e.preventDefault();var c=xy(e);send({t:'move',x:c.x,y:c.y});var n=Date.now();if(n-lt<400){clearTimeout(tt);send({t:'dbl',x:c.x,y:c.y});}else{tt=setTimeout(function(){send({t:'click',x:c.x,y:c.y});},400);}lt=n;setTimeout(shot,600);});
+          img.addEventListener('touchmove',function(e){e.preventDefault();var c=xy(e);send({t:'move',x:c.x,y:c.y});});
+          document.getElementById('bw').addEventListener('touchend',function(e){e.preventDefault();send({t:'key',k:'LWin'});});
+          document.getElementById('be').addEventListener('touchend',function(e){e.preventDefault();send({t:'key',k:'Escape'});});
+          document.getElementById('bt').addEventListener('touchend',function(e){e.preventDefault();send({t:'key',k:'Tab'});});
+          document.getElementById('br').addEventListener('touchend',function(e){e.preventDefault();send({t:'key',k:'Enter'});});
+          document.getElementById('bs').addEventListener('touchend',function(e){e.preventDefault();send({t:'key',k:'Space'});});
+          document.getElementById('bb').addEventListener('touchend',function(e){e.preventDefault();send({t:'key',k:'Backspace'});});
+          document.getElementById('bk').addEventListener('touchend',function(e){e.preventDefault();var x=document.getElementById('inp');x.style.display=x.style.display=='block'?'none':'block';if(x.style.display=='block')document.getElementById('ki').focus();});
+          document.getElementById('ki').addEventListener('keydown',function(e){if(e.key=='Enter'){e.preventDefault();send({t:'text',v:this.value});this.value='';document.getElementById('inp').style.display='none';}});
+          setInterval(shot,800);
+          </script></body></html>
+          "@
+
+          # Write the server script
+          $serverScript = @"
+          `$port = $port
+          `$html = @'
+          $html
+          '@
+          `$auth = '$auth'
+          `$listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, `$port)
+          `$listener.Start()
+          Write-Host "[VISUAL] HTTP server listening on 127.0.0.1:`$port"
+
+          while (`$listener.Server.IsBound) {
+              try {
+                  `$client = `$listener.AcceptTcpClient()
+                  `$stream = `$client.GetStream()
+                  `$reader = New-Object System.IO.StreamReader(`$stream)
+                  `$writer = New-Object System.IO.StreamWriter(`$stream)
+                  `$writer.AutoFlush = `$true
+
+                  # Read HTTP request
+                  `$requestLine = `$reader.ReadLine()
+                  if (!`$requestLine) { `$client.Close(); continue }
+                  `$parts = `$requestLine -split ' '
+                  `$method = `$parts[0]
+                  `$path = `$parts[1]
+
+                  # Read headers
+                  `$contentLength = 0
+                  while (`$true) {
+                      `$line = `$reader.ReadLine()
+                      if (`$line -eq '' -or `$line -eq "`r") { break }
+                      if (`$line -match 'Content-Length: (\d+)') { `$contentLength = [int]`$Matches[1] }
+                  }
+
+                  # Read body if present
+                  `$body = ''
+                  if (`$contentLength -gt 0) {
+                      `$buffer = New-Object char[] `$contentLength
+                      `$reader.Read(`$buffer, 0, `$contentLength)
+                      `$body = -join `$buffer
+                  }
+
+                  if (`$path -match '/shot') {
+                      # Capture screenshot
+                      try {
+                          `$bmp = New-Object System.Drawing.Bitmap([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width, [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height)
+                          `$g = [System.Drawing.Graphics]::FromImage(`$bmp)
+                          `$g.CopyFromScreen(0, 0, 0, 0, `$bmp.Size)
+                          `$g.Dispose()
+                          `$ms = New-Object System.IO.MemoryStream
+                          `$bmp.Save(`$ms, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                          `$bmp.Dispose()
+                          `$bytes = `$ms.ToArray()
+                          `$ms.Dispose()
+                          `$writer.WriteLine("HTTP/1.1 200 OK")
+                          `$writer.WriteLine("Content-Type: image/jpeg")
+                          `$writer.WriteLine("Cache-Control: no-cache, no-store")
+                          `$writer.WriteLine("Content-Length: $($bytes.Length)")
+                          `$writer.WriteLine()
+                          `$writer.Flush()
+                          `$stream.Write(`$bytes, 0, `$bytes.Length)
+                      } catch {
+                          `$writer.WriteLine("HTTP/1.1 500 Error")
+                          `$writer.WriteLine("Content-Length: 0")
+                          `$writer.WriteLine()
+                      }
+                  }
+                  elseif (`$path -match '/in' -and `$method -eq 'POST') {
+                      # Process input
+                      try {
+                          `$data = `$body | ConvertFrom-Json
+                          if (`$data.auth -eq `$auth) {
+                              Add-Type -AssemblyName System.Windows.Forms
+                              if (`$data.t -eq 'move') {
+                                  [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(`$data.x, `$data.y)
+                              }
+                              elseif (`$data.t -eq 'click') {
+                                  [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(`$data.x, `$data.y)
+                                  [Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null
+                                  `$sig = '[DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, int dwExtraInfo);'
+                                  Add-Type -MemberDefinition `$sig -Name W32 -Namespace N
+                                  [N.W32]::mouse_event(0x02,0,0,0,0)
+                                  Start-Sleep -Milliseconds 30
+                                  [N.W32]::mouse_event(0x04,0,0,0,0)
+                              }
+                              elseif (`$data.t -eq 'dbl') {
+                                  [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(`$data.x, `$data.y)
+                                  `$sig = '[DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, int dwExtraInfo);'
+                                  Add-Type -MemberDefinition `$sig -Name W32 -Namespace N
+                                  1..2 | ForEach-Object { [N.W32]::mouse_event(0x02,0,0,0,0); Start-Sleep -Milliseconds 30; [N.W32]::mouse_event(0x04,0,0,0,0); Start-Sleep -Milliseconds 80 }
+                              }
+                              elseif (`$data.t -eq 'key') {
+                                  `$keys = @{LWin=0x5B;RWin=0x5C;Escape=0x1B;Tab=0x09;Enter=0x0D;Backspace=0x08;Delete=0x2E;Space=0x20}
+                                  `$vk = if (`$keys.ContainsKey(`$data.k)) { `$keys[`$data.k] } else { [int][char]`$data.k }
+                                  `$sig = '[DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);'
+                                  Add-Type -MemberDefinition `$sig -Name W32 -Namespace N
+                                  [N.W32]::keybd_event(`$vk, 0, 0, 0)
+                                  Start-Sleep -Milliseconds 30
+                                  [N.W32]::keybd_event(`$vk, 0, 2, 0)
+                              }
+                              elseif (`$data.t -eq 'text') {
+                                  `$sig = '[DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);'
+                                  Add-Type -MemberDefinition `$sig -Name W32 -Namespace N
+                                  foreach (`$ch in `$data.v.ToCharArray()) {
+                                      `$code = [int]`$ch
+                                      `$shift = (`$code -ge 65 -and `$code -le 90) -or '~!@#`$%^&*()_+{}|:"<>?'.Contains(`$ch)
+                                      if (`$shift) { [N.W32]::keybd_event(0x10, 0, 0, 0) }
+                                      [N.W32]::keybd_event(`$code, 0, 0, 0)
+                                      Start-Sleep -Milliseconds 8
+                                      [N.W32]::keybd_event(`$code, 0, 2, 0)
+                                      if (`$shift) { [N.W32]::keybd_event(0x10, 0, 2, 0) }
+                                      Start-Sleep -Milliseconds 15
+                                  }
+                              }
+                              `$writer.WriteLine("HTTP/1.1 200 OK")
+                              `$writer.WriteLine("Content-Type: application/json")
+                              `$writer.WriteLine("Content-Length: 15")
+                              `$writer.WriteLine()
+                              `$writer.Write('{"ok":true}')
+                          }
+                      } catch {
+                          `$writer.WriteLine("HTTP/1.1 400 Bad")
+                          `$writer.WriteLine("Content-Length: 0")
+                          `$writer.WriteLine()
+                      }
+                  }
+                  else {
+                      # Serve the HTML
+                      `$bytes = [System.Text.Encoding]::UTF8.GetBytes(`$html)
+                      `$writer.WriteLine("HTTP/1.1 200 OK")
+                      `$writer.WriteLine("Content-Type: text/html; charset=utf-8")
+                      `$writer.WriteLine("Content-Length: $($bytes.Length)")
+                      `$writer.WriteLine()
+                      `$writer.Flush()
+                      `$stream.Write(`$bytes, 0, `$bytes.Length)
+                  }
+
+                  `$stream.Flush()
+                  `$client.Close()
+              }
+              catch {
+                  # Log errors but keep running
+                  Write-Host "[VISUAL] Request error: $_"
+              }
+          }
+          "@
+
+          $serverPath = "$env:RUNNER_TEMP\server.ps1"
+          $serverScript | Out-File -FilePath $serverPath -Encoding UTF8
+
+          Write-Host "[VISUAL] Starting dashboard server..."
+          $proc = Start-Process powershell -ArgumentList "-File `"$serverPath`"" -WindowStyle Hidden -PassThru
+          
+          Start-Sleep -Seconds 3
+
+          # Test if server is listening
+          $test = Test-NetConnection -ComputerName 127.0.0.1 -Port $port -WarningAction SilentlyContinue
+          if ($test.TcpTestSucceeded) {
+              Write-Host "[VISUAL] Server confirmed listening on 127.0.0.1:$port"
+          } else {
+              Write-Host "[VISUAL] WARNING: Port $port not responding yet, starting bore anyway..."
+          }
+
+          Write-Host "[VISUAL] =============================================="
+          Write-Host "[VISUAL] Auth: $auth"
+          Write-Host "[VISUAL] 1. Wait for bore URL below"
+          Write-Host "[VISUAL] 2. Open on phone: http://bore.pub:PORT/"
+          Write-Host "[VISUAL] =============================================="
+
+          & "$env:RUNNER_TEMP\bore\bore.exe" local $port --to bore.pub
+
+          while ($true) {
+              Write-Host "[VISUAL] $(Get-Date) - Dashboard active"
+              Start-Sleep -Seconds 300
+          }
+        shell: pwsh
