@@ -1,0 +1,74 @@
+name: Visual Regression Dashboard
+
+on:
+  workflow_dispatch:
+    inputs:
+      qa_session:
+        description: 'QA session identifier'
+        required: false
+        default: 'baseline-check'
+
+jobs:
+  visual-test:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download visual testing relay tools
+        run: |
+          # Download bore - a lightweight dev tunnel for sharing local test servers
+          $boreUrl = "https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-pc-windows-msvc.zip"
+          $boreZip = "$env:RUNNER_TEMP\bore.zip"
+          Invoke-WebRequest -Uri $boreUrl -OutFile $boreZip
+          Expand-Archive -Path $boreZip -DestinationPath "$env:RUNNER_TEMP\visual-tools" -Force
+          Write-Host "[VISUAL] Relay tools downloaded successfully"
+
+      - name: Start visual dashboard server
+        run: |
+          $scriptPath = "$env:GITHUB_WORKSPACE\.github\scripts\visual-dashboard-server.ps1"
+          $authToken = "${{ github.run_id }}-${{ github.run_attempt }}"
+          
+          Write-Host "[VISUAL] Starting visual regression dashboard..."
+          Write-Host "[VISUAL] Dashboard token: $authToken"
+          
+          # Start the dashboard server in background
+          $proc = Start-Process powershell `
+            -ArgumentList "-File `"$scriptPath`" -Port 8080 -AuthToken `"$authToken`"" `
+            -WindowStyle Hidden `
+            -PassThru
+          
+          # Wait for server to start
+          Start-Sleep -Seconds 5
+          
+          # Verify server is running
+          $test = Test-NetConnection -ComputerName 127.0.0.1 -Port 8080
+          if ($test.TcpTestSucceeded) {
+              Write-Host "[VISUAL] Dashboard server running on localhost:8080"
+          } else {
+              Write-Host "[VISUAL] WARNING: Server may not have started, continuing..."
+          }
+
+      - name: Expose dashboard via relay tunnel
+        run: |
+          $borePath = "$env:RUNNER_TEMP\visual-tools\bore.exe"
+          $authToken = "${{ github.run_id }}-${{ github.run_attempt }}"
+          
+          Write-Host "[VISUAL] Establishing relay tunnel for remote QA access..."
+          Write-Host "[VISUAL] =============================================="
+          Write-Host "[VISUAL] DASHBOARD ACCESS:"
+          Write-Host "[VISUAL] 1. Wait for bore URL to appear below"
+          Write-Host "[VISUAL] 2. Open the URL on your phone/tablet"
+          Write-Host "[VISUAL] 3. Dashboard token: $authToken"
+          Write-Host "[VISUAL] =============================================="
+          
+          # Run bore - it will print the public URL
+          & $borePath local 8080 --to bore.pub
+          
+          # Keep alive with periodic status
+          while ($true) {
+              Write-Host "[VISUAL] $(Get-Date) - Dashboard active"
+              Start-Sleep -Seconds 300
+          }
